@@ -1,0 +1,12 @@
+# Credenciais reais
+secrets.h
+
+# Temporários
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Build/cache
+build/
+.cache/
