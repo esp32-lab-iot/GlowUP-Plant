@@ -1,5 +1,10 @@
 # Credenciais reais
 secrets.h
+**/secrets.h
+
+# Mantém o modelo no repositório
+!fake_secrets.h
+**/fake_secrets.h
 
 # Temporários
 *.tmp
