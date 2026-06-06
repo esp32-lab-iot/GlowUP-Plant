@@ -35,3 +35,7 @@ Depois edite o arquivo `secrets.h` criado e preencha com seus dados reais.
 <a href="https://app.cirkitdesigner.com/project/ce25b819-92e0-4bf0-b35e-8e1f78cec135" target="_blank">
   <img src="docs/imagens/circuit_image.png" alt="Diagrama de montagem do GlowUP Plant" width="800">
 </a>
+
+## Vídeo de demonstração
+
+[![Demonstração do GlowUP Plant](https://img.youtube.com/vi/ID_DO_VIDEO/hqdefault.jpg)](https://youtube.com/shorts/4GctZmP4FU4?feature=share)
