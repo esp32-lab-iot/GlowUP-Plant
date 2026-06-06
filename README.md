@@ -22,3 +22,9 @@ Na raiz do projeto, execute:
 
 ```bash
 ./setup_secrets.sh
+
+## Diagrama de montagem
+
+A figura abaixo mostra o diagrama de ligação do projeto GlowUP Plant.
+
+[![Diagrama de montagem do GlowUP Plant](docs/imagens/diagrama_montagem.png)]([![Diagrama de montagem do GlowUP Plant](docs/imagens/diagrama_montagem.png)](https://app.cirkitdesigner.com/project/ce25b819-92e0-4bf0-b35e-8e1f78cec135))
