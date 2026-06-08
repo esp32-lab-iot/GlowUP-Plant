@@ -39,3 +39,13 @@ Depois edite o arquivo `secrets.h` criado e preencha com seus dados reais.
 ## Vídeo de demonstração
 
 [![Demonstração do GlowUP Plant](https://img.youtube.com/vi/ID_DO_VIDEO/hqdefault.jpg)](https://youtube.com/shorts/4GctZmP4FU4?feature=share)
+
+## Planilha modelo
+
+Este projeto possui uma planilha modelo no Google Sheets.
+
+Use o link abaixo para criar sua própria cópia:
+
+[Copiar planilha modelo](https://docs.google.com/spreadsheets/d/1QTHLuNLvVn8JgMqz4i_d4QXfSozsNgKqgmKVz3vZsk8/edit?usp=copy)
+
+Depois de copiar, configure sua própria chave Gemini e sua própria implantação do Apps Script.
