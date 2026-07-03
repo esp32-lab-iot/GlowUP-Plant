@@ -49,3 +49,6 @@ Use o link abaixo para criar sua própria cópia:
 [Copiar planilha modelo](https://docs.google.com/spreadsheets/d/1QTHLuNLvVn8JgMqz4i_d4QXfSozsNgKqgmKVz3vZsk8/edit?usp=copy)
 
 Depois de copiar, configure sua própria chave Gemini e sua própria implantação do Apps Script.
+
+## Dashboard no google Looker
+[Dashboard](https://datastudio.google.com/reporting/d3c09632-8be1-4996-8859-24505eaaaca3)
