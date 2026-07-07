@@ -52,3 +52,8 @@ Depois de copiar, configure sua própria chave Gemini e sua própria implantaç�
 
 ## Dashboard no google Looker
 [Dashboard](https://datastudio.google.com/reporting/d3c09632-8be1-4996-8859-24505eaaaca3)
+
+## Esquemático e Layout no EasyEDA
+
+[HomePage do projeto EasyEDA]( https://oshwlab.com/oliveiralcm/project_raxjpsjj)
+[Layout e PCB](https://easyeda.com/editor#project_id=1700eb66ad914f08909b0ec1cce09d03)
