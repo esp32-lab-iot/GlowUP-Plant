@@ -6,6 +6,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <FluxGarage_RoboEyes.h>
+#include "Adafruit_VL53L0X.h"
+#include "esp_sleep.h"
 #include "secrets.h" // WIFI_SSID, WIFI_PASS e GOOGLE_SCRIPT_URL
 
 // ==========================================
@@ -15,17 +17,41 @@
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-RoboEyes<Adafruit_SSD1306> roboEyes(display);
-
-// Cliente HTTPS global
-WiFiClientSecure client;
+#define SDA_PIN 8
+#define SCL_PIN 9
 
 const int SensorPin = 1;     // GPIO 1 - Sensor de umidade
 #define BUZZER_PIN 4         // GPIO 4 - Buzzer ativo
 
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+RoboEyes<Adafruit_SSD1306> roboEyes(display);
+Adafruit_VL53L0X lox = Adafruit_VL53L0X();
+
+// Cliente HTTPS global
+WiFiClientSecure client;
+
 const int AirValue = 3800;
 const int WaterValue = 1326;
+
+// ==========================================
+// CONFIGURAÇÕES DO SENSOR DE DISTÂNCIA / SONO
+// ==========================================
+const int LIMIAR_PRESENCA_MM = 1000;  // pessoa a menos de 1 m
+const int LIMIAR_SAIDA_MM    = 1200;  // histerese para considerar afastamento
+
+const uint64_t TEMPO_DEEP_SLEEP_US = 1000000ULL; // acorda a cada 1 segundo
+
+const unsigned long TEMPO_AFASTADO_PARA_DORMIR = 30000; // 30 segundos
+const unsigned long JANELA_UPLOAD_MS = 8000; // segurança para novo upload após reset/manual
+
+// ==========================================
+// ENVIO PARA GOOGLE SHEETS
+// ==========================================
+const unsigned long intervaloGoogleSheets = 3600000UL; // 1 hora em ms 360.00 para valer
+const uint32_t intervaloGoogleSheetsSegundos = 3600;   // 1 hora em segundos 30 segundos no teste, 3600 pra valer
+
+// Esta variável sobrevive ao deep sleep
+RTC_DATA_ATTR uint32_t segundosDesdeUltimoEnvioSheets = 0;
 
 // ==========================================
 // VARIÁVEIS GLOBAIS
@@ -36,21 +62,23 @@ int soilMoistureValue = 0;
 int soilmoisturepercent = 0;
 
 unsigned long temporizadorSensor = 0;
+unsigned long temporizadorDistancia = 0;
 unsigned long temporizadorAnimacaoExtra = 0;
 unsigned long temporizadorBuzzer = 0;
 unsigned long temporizadorGoogleSheets = 0;
+unsigned long tempoUltimaPresenca = 0;
 
 // Controle dos bipes da planta seca
 unsigned long temporizadorBipSeco = 0;
 bool bipSecoAtivo = false;
 const unsigned long duracaoBipSeco = 70;
 
-// Envio para Google Sheets
-const unsigned long intervaloGoogleSheets = 3600000; // 1 hora
-
 int estadoAtual = 2;
 int ultimoEstado = -1;
 bool estadoBuzzer = false;
+
+bool displayInicializado = false;
+bool sistemaAtivo = false;
 
 // ==========================================
 // CONVERTE ESTADO EM TEXTO
@@ -70,6 +98,91 @@ String nomeEstado(int estado) {
     default:
       return "Indefinido";
   }
+}
+
+// ==========================================
+// LÊ DISTÂNCIA UMA VEZ
+// ==========================================
+bool medirDistancia(int &distancia_mm) {
+  VL53L0X_RangingMeasurementData_t medida;
+
+  lox.rangingTest(&medida, false);
+
+  if (medida.RangeStatus != 4) {
+    distancia_mm = medida.RangeMilliMeter;
+
+    if (distancia_mm > 0 && distancia_mm < 2000) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// ==========================================
+// LÊ UMIDADE SEM USAR ROBOEYES
+// Usada quando a planta acorda só para enviar dados
+// ==========================================
+void lerUmidadeBasicaSemFace() {
+  soilMoistureValue = analogRead(SensorPin);
+
+  soilmoisturepercent = map(soilMoistureValue, AirValue, WaterValue, 0, 100);
+
+  if (soilmoisturepercent > 100) soilmoisturepercent = 100;
+  if (soilmoisturepercent < 0)   soilmoisturepercent = 0;
+
+  if (soilmoisturepercent <= 20)      estadoAtual = 0;
+  else if (soilmoisturepercent <= 45) estadoAtual = 1;
+  else if (soilmoisturepercent <= 75) estadoAtual = 2;
+  else if (soilmoisturepercent <= 90) estadoAtual = 3;
+  else                                estadoAtual = 4;
+
+  Serial.print("Umidade Solo: ");
+  Serial.print(soilmoisturepercent);
+  Serial.print("% | ADC: ");
+  Serial.print(soilMoistureValue);
+  Serial.print(" | Estado: ");
+  Serial.println(nomeEstado(estadoAtual));
+}
+
+// ==========================================
+// ENTRA EM DEEP SLEEP POR TIMER
+// ==========================================
+void entrarEmDeepSleep() {
+  Serial.println("Preparando para deep sleep...");
+
+  // Se a planta estava ativa, soma o tempo acordado ao contador persistente
+  if (sistemaAtivo && temporizadorGoogleSheets > 0) {
+    uint32_t segundosAtivoDesdeUltimoEnvio = (millis() - temporizadorGoogleSheets) / 1000;
+    segundosDesdeUltimoEnvioSheets += segundosAtivoDesdeUltimoEnvio;
+
+    Serial.print("Somando tempo ativo antes de dormir: ");
+    Serial.print(segundosAtivoDesdeUltimoEnvio);
+    Serial.println(" s");
+
+    Serial.print("Total acumulado para Sheets: ");
+    Serial.print(segundosDesdeUltimoEnvioSheets);
+    Serial.println(" s");
+  }
+
+  digitalWrite(BUZZER_PIN, LOW);
+
+  if (displayInicializado) {
+    display.clearDisplay();
+    display.display();
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  Serial.println("Dormindo. Vou acordar em 1 segundo para verificar presenca.");
+  Serial.flush();
+
+  esp_sleep_enable_timer_wakeup(TEMPO_DEEP_SLEEP_US);
+
+  delay(100);
+  esp_deep_sleep_start();
 }
 
 // ==========================================
@@ -157,7 +270,10 @@ void ajustarHorarioNTP() {
   int tentativas = 0;
 
   while (!getLocalTime(&timeinfo) && tentativas < 20) {
-    roboEyes.update();
+    if (displayInicializado) {
+      roboEyes.update();
+    }
+
     delay(500);
     Serial.print(".");
     tentativas++;
@@ -173,19 +289,20 @@ void ajustarHorarioNTP() {
 
 // ==========================================
 // ENVIA DADOS PARA O GOOGLE SHEETS
+// Retorna true se enviou com sucesso
 // ==========================================
-void enviarDadosGoogleSheets() {
+bool enviarDadosGoogleSheets() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[Sheets] Wi-Fi desconectado. Tentando reconectar...");
     WiFi.reconnect();
-    return;
+    return false;
   }
 
   HTTPClient http;
 
   if (!http.begin(client, GOOGLE_SCRIPT_URL)) {
     Serial.println("[Sheets] Falha na conexão.");
-    return;
+    return false;
   }
 
   // Evita resposta HTML "Moved Temporarily"
@@ -199,14 +316,23 @@ void enviarDadosGoogleSheets() {
   payload += "\"estado\":\"" + nomeEstado(estadoAtual) + "\"";
   payload += "}";
 
+  Serial.print("[Sheets] Payload: ");
+  Serial.println(payload);
+
   int httpCode = http.POST(payload);
 
   if (httpCode == 200) {
     Serial.println("[Sheets] Dados enviados com sucesso.");
+    http.end();
+    return true;
   } 
   else if (httpCode > 0) {
     Serial.print("[Sheets] Resposta HTTP inesperada: ");
     Serial.println(httpCode);
+
+    String resposta = http.getString();
+    Serial.println("[Sheets] Resposta:");
+    Serial.println(resposta);
   } 
   else {
     Serial.print("[Sheets] Erro no envio: ");
@@ -214,104 +340,21 @@ void enviarDadosGoogleSheets() {
   }
 
   http.end();
+  return false;
 }
 
 // ==========================================
-// SETUP
+// CONTROLE DO BUZZER
 // ==========================================
-void setup() {
-  Serial.begin(115200);
-
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-
-  Wire.begin(8, 9);
-
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("Falha ao inicializar o SSD1306"));
-    for (;;);
-  }
-
-  roboEyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 100);
-  roboEyes.setAutoblinker(ON, 3, 2);
-  roboEyes.setIdleMode(ON, 2, 2);
-  roboEyes.setBorderradius(6, 6);
-
-  // -----------------------------------------------------------------
-  // CONEXÃO WI-FI
-  // -----------------------------------------------------------------
-  Serial.print("Conectando à rede: ");
-  Serial.println(WIFI_SSID);
-
-  roboEyes.setMood(DEFAULT);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  unsigned long temporizadorSerialWifi = millis();
-
-  while (WiFi.status() != WL_CONNECTED) {
-    roboEyes.update();
-
-    if (millis() - temporizadorSerialWifi > 500) {
-      temporizadorSerialWifi = millis();
-      Serial.print(".");
-    }
-  }
-
-  Serial.println("\nWi-Fi Conectado com sucesso!");
-  Serial.print("IP obtido: ");
-  Serial.println(WiFi.localIP());
-
-  client.setInsecure();
-
-  ajustarHorarioNTP();
-
-  // Comemoração visual e sonora de conexão estabelecida
-  roboEyes.setMood(HAPPY);
-
-  if (!modoSilencioso) {
-    digitalWrite(BUZZER_PIN, HIGH); delay(40);
-    digitalWrite(BUZZER_PIN, LOW);  delay(40);
-    digitalWrite(BUZZER_PIN, HIGH); delay(100);
-    digitalWrite(BUZZER_PIN, LOW);
-  }
-
-  Serial.println("--- Planta Inteligente Online e Inicializada ---");
-
-  // Primeira leitura e primeiro envio logo ao ligar
-  atualizarSensorEEstado();
-  enviarDadosGoogleSheets();
-
-  // Reinicia o contador para o próximo envio acontecer daqui a 1 hora
-  temporizadorGoogleSheets = millis();
-}
-
-// ==========================================
-// LOOP
-// ==========================================
-void loop() {
-  roboEyes.update();
-
-  // -----------------------------------------------------------------
-  // BLOCO 1: LEITURA DO SENSOR E MAPEAMENTO
-  // -----------------------------------------------------------------
-  if (millis() - temporizadorSensor > 2000) {
-    temporizadorSensor = millis();
-    atualizarSensorEEstado();
-  }
-
-  // -----------------------------------------------------------------
-  // BLOCO 2: ALARMES SONOROS RÍTMICOS
-  // -----------------------------------------------------------------
-
+void atualizarBuzzer() {
   if (modoSilencioso) {
     digitalWrite(BUZZER_PIN, LOW);
     bipSecoAtivo = false;
+    return;
   }
 
   // Estado 4: crítico afogando — alarme rápido, em pânico
-  else if (estadoAtual == 4) {
+  if (estadoAtual == 4) {
     if (millis() - temporizadorBuzzer > 100) {
       temporizadorBuzzer = millis();
       estadoBuzzer = !estadoBuzzer;
@@ -323,10 +366,6 @@ void loop() {
 
   // Estado 0: crítico seco — bipes curtos e cada vez mais lentos
   else if (estadoAtual == 0) {
-
-    // Quanto mais seca a planta, maior o intervalo entre os bipes.
-    // 20% -> bip a cada 900 ms
-    // 0%  -> bip a cada 5000 ms
     unsigned long intervaloBipSeco = map(soilmoisturepercent, 0, 20, 5000, 900);
 
     if (!bipSecoAtivo) {
@@ -362,6 +401,245 @@ void loop() {
     digitalWrite(BUZZER_PIN, LOW);
     bipSecoAtivo = false;
   }
+}
+
+// ==========================================
+// INICIALIZA OLED E ROBOEYES
+// ==========================================
+void inicializarDisplayERoboEyes() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("Falha ao inicializar o SSD1306"));
+    for (;;);
+  }
+
+  displayInicializado = true;
+  display.ssd1306_command(SSD1306_DISPLAYON);
+
+  roboEyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 100);
+  roboEyes.setAutoblinker(ON, 3, 2);
+  roboEyes.setIdleMode(ON, 2, 2);
+  roboEyes.setBorderradius(6, 6);
+  roboEyes.setMood(DEFAULT);
+}
+
+// ==========================================
+// INICIALIZA WI-FI
+// ==========================================
+void inicializarWiFi() {
+  Serial.print("Conectando à rede: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long temporizadorSerialWifi = millis();
+
+  while (WiFi.status() != WL_CONNECTED) {
+    if (displayInicializado) {
+      roboEyes.update();
+    }
+
+    if (millis() - temporizadorSerialWifi > 500) {
+      temporizadorSerialWifi = millis();
+      Serial.print(".");
+    }
+  }
+
+  Serial.println("\nWi-Fi Conectado com sucesso!");
+  Serial.print("IP obtido: ");
+  Serial.println(WiFi.localIP());
+
+  client.setInsecure();
+
+  ajustarHorarioNTP();
+}
+
+// ==========================================
+// ENVIO SILENCIOSO QUANDO A PLANTA ESTÁ DORMINDO
+// ==========================================
+void enviarDadosDormindoSeNecessario() {
+  if (segundosDesdeUltimoEnvioSheets < intervaloGoogleSheetsSegundos) {
+    return;
+  }
+
+  Serial.println("Intervalo de envio atingido durante deep sleep.");
+  Serial.println("Acordando apenas para enviar dados ao Google Sheets.");
+
+  lerUmidadeBasicaSemFace();
+
+  inicializarWiFi();
+
+  if (enviarDadosGoogleSheets()) {
+    segundosDesdeUltimoEnvioSheets = 0;
+    Serial.println("[Sheets] Contador RTC zerado apos envio.");
+  } else {
+    Serial.println("[Sheets] Envio falhou. Tentara novamente no proximo ciclo.");
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+
+// ==========================================
+// INICIALIZA SISTEMA ATIVO DA PLANTA
+// ==========================================
+void inicializarSistemaAtivo() {
+  sistemaAtivo = true;
+
+  inicializarDisplayERoboEyes();
+
+  roboEyes.setMood(DEFAULT);
+
+  inicializarWiFi();
+
+  // Comemoração visual e sonora de conexão estabelecida
+  roboEyes.setMood(HAPPY);
+
+  if (!modoSilencioso) {
+    digitalWrite(BUZZER_PIN, HIGH); delay(40);
+    digitalWrite(BUZZER_PIN, LOW);  delay(40);
+    digitalWrite(BUZZER_PIN, HIGH); delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  Serial.println("--- GlowUp Plant Online e Inicializada ---");
+
+  // Primeira leitura e primeiro envio logo ao ativar por presença
+  atualizarSensorEEstado();
+
+  if (enviarDadosGoogleSheets()) {
+    segundosDesdeUltimoEnvioSheets = 0;
+  }
+
+  temporizadorGoogleSheets = millis();
+  temporizadorSensor = millis();
+  temporizadorDistancia = millis();
+  tempoUltimaPresenca = millis();
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println();
+  Serial.println("===== GlowUp Plant - Deep Sleep por Presenca + Envio Periodico =====");
+
+  esp_sleep_wakeup_cause_t motivo = esp_sleep_get_wakeup_cause();
+
+  if (motivo == ESP_SLEEP_WAKEUP_TIMER) {
+    Serial.println("Acordou pelo timer.");
+
+    segundosDesdeUltimoEnvioSheets += TEMPO_DEEP_SLEEP_US / 1000000ULL;
+
+    Serial.print("Tempo acumulado desde ultimo envio Sheets: ");
+    Serial.print(segundosDesdeUltimoEnvioSheets);
+    Serial.println(" s");
+  } else {
+    Serial.println("Inicializacao normal, reset ou upload.");
+    Serial.println("Janela de seguranca para novo upload...");
+    delay(JANELA_UPLOAD_MS);
+
+    // Para teste, se quiser forçar envio em poucos segundos,
+    // descomente a linha abaixo:
+    // segundosDesdeUltimoEnvioSheets = intervaloGoogleSheetsSegundos;
+  }
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // OLED e VL53L0X compartilham o mesmo barramento I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Inicializa apenas o sensor de distância para decidir se ativa o sistema
+  if (!lox.begin(0x29, false, &Wire, Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED)) {
+    Serial.println("Falha ao inicializar VL53L0X.");
+    Serial.println("Sem sensor de presenca, sistema ficara ativo para diagnostico.");
+
+    inicializarSistemaAtivo();
+    return;
+  }
+
+  int distancia = 0;
+
+  if (medirDistancia(distancia)) {
+    Serial.print("Distancia inicial: ");
+    Serial.print(distancia);
+    Serial.println(" mm");
+
+    if (distancia < LIMIAR_PRESENCA_MM) {
+      Serial.println("Presenca detectada. Ativando GlowUp Plant.");
+      inicializarSistemaAtivo();
+      return;
+    }
+  } else {
+    Serial.println("Sem leitura valida de distancia.");
+  }
+
+  Serial.println("Nenhuma pessoa proxima.");
+
+  // Se completou 1 hora durante o sono, envia mesmo sem presença
+  enviarDadosDormindoSeNecessario();
+
+  Serial.println("Voltando ao deep sleep.");
+  entrarEmDeepSleep();
+}
+
+// ==========================================
+// LOOP
+// ==========================================
+void loop() {
+  roboEyes.update();
+
+  // -----------------------------------------------------------------
+  // BLOCO 0: VERIFICA PRESENÇA
+  // Enquanto houver pessoa perto, sistema continua ativo.
+  // Se afastar por mais de 30 segundos, dorme.
+  // -----------------------------------------------------------------
+  if (millis() - temporizadorDistancia > 500) {
+    temporizadorDistancia = millis();
+
+    int distancia = 0;
+
+    if (medirDistancia(distancia)) {
+      Serial.print("Distancia: ");
+      Serial.print(distancia);
+      Serial.println(" mm");
+
+      if (distancia < LIMIAR_PRESENCA_MM) {
+        tempoUltimaPresenca = millis();
+      }
+
+      if (distancia > LIMIAR_SAIDA_MM) {
+        if (millis() - tempoUltimaPresenca > TEMPO_AFASTADO_PARA_DORMIR) {
+          Serial.println("Pessoa afastada por mais de 30 segundos.");
+          entrarEmDeepSleep();
+        }
+      }
+    } else {
+      Serial.println("Sem leitura valida de distancia.");
+
+      if (millis() - tempoUltimaPresenca > TEMPO_AFASTADO_PARA_DORMIR) {
+        Serial.println("Sem presenca confirmada por mais de 30 segundos.");
+        entrarEmDeepSleep();
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // BLOCO 1: LEITURA DO SENSOR DE UMIDADE
+  // -----------------------------------------------------------------
+  if (millis() - temporizadorSensor > 2000) {
+    temporizadorSensor = millis();
+    atualizarSensorEEstado();
+  }
+
+  // -----------------------------------------------------------------
+  // BLOCO 2: ALARMES SONOROS RÍTMICOS
+  // -----------------------------------------------------------------
+  atualizarBuzzer();
 
   // -----------------------------------------------------------------
   // BLOCO 3: SURTOS DE ANIMAÇÃO DINÂMICA
@@ -379,10 +657,14 @@ void loop() {
 
   // -----------------------------------------------------------------
   // BLOCO 4: ENVIO AO GOOGLE SHEETS
-  // Envia uma vez ao ligar e depois a cada 1 hora
+  // Envia uma vez ao ativar e depois a cada 1 hora,
+  // enquanto houver pessoa perto e o sistema estiver ativo.
   // -----------------------------------------------------------------
   if (millis() - temporizadorGoogleSheets > intervaloGoogleSheets) {
     temporizadorGoogleSheets = millis();
-    enviarDadosGoogleSheets();
+
+    if (enviarDadosGoogleSheets()) {
+      segundosDesdeUltimoEnvioSheets = 0;
+    }
   }
 }
